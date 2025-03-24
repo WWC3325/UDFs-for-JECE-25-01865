@@ -1,0 +1,611 @@
+#include "udf.h"
+#include "dpm.h"
+#include "sg_mphase.h"
+#include "sg_disco.h"
+
+/* Constants for methane combustion (Franzelli et al.) */
+#define A1 4.9e9      /* Pre-exponential factor for CH4 oxidation */
+#define E1 35500.0    /* Activation energy for CH4 oxidation [J/mol] */
+#define A2 2.0e8      /* Pre-exponential factor for CO oxidation */
+#define E2 12000.0    /* Activation energy for CO oxidation [J/mol] */
+
+/* Constants for Mg(NO3)2·2H2O decomposition */
+#define A_DEH 1.0e13  /* Pre-exponential factor for dehydration */ 
+#define E_DEH 88000.0 /* Activation energy for dehydration [J/mol] */
+#define A_DEN 2.5e14  /* Pre-exponential factor for denitration */
+#define E_DEN 180000.0 /* Activation energy for denitration [J/mol] */
+
+/* Molecular weights [kg/mol] */
+#define MW_H2O 0.018015
+#define MW_NO2 0.046005
+#define MW_O2 0.032
+#define MW_CH4 0.016043
+#define MW_CO 0.028010
+#define MW_CO2 0.044010
+#define MW_MG_NITRATE_DIHYDRATE 0.256415 /* Mg(NO3)2·2H2O */
+#define MW_MG_NITRATE 0.220385          /* Mg(NO3)2 */
+#define MW_MGO 0.040304                 /* MgO */
+
+/* Universal gas constant [J/(mol·K)] */
+#define R_UNIVERSAL 8.3145
+
+/* Heat of reactions [J/kg] */
+#define HEAT_DEH 880000.0   /* Heat for dehydration */
+#define HEAT_DEN 2100000.0  /* Heat for denitration */
+
+/* Species indices - must match Fluent species order */
+/* These need to be adjusted based on your specific setup */
+#define ID_CH4 0
+#define ID_O2 1
+#define ID_CO 2
+#define ID_CO2 3
+#define ID_H2O 4
+#define ID_NO2 5
+#define ID_N2 6
+
+/* Stoichiometric coefficients for methane combustion */
+#define CH4_COEF 1.0
+#define O2_COEF_1 1.5
+#define CO_COEF 1.0
+#define H2O_COEF 2.0
+#define O2_COEF_2 0.5
+#define CO2_COEF 1.0
+
+/* Global variables for tracking */
+static real total_heat_combustion = 0.0;
+static real total_heat_decomposition = 0.0;
+
+/*----------------------------------------------------------------------
+  Pre-exponential correction functions for methane combustion
+----------------------------------------------------------------------*/
+real f1_phi(real phi)
+{
+    real f1;
+    real term1, term2, term3;
+    
+    term1 = tanh((1.1 - phi) / 0.09);
+    term2 = 0.37 * (1.0 + tanh((phi - 1.13) / 0.03));
+    term3 = 6.7 * (1.0 + tanh((phi - 1.6) / 0.22));
+    
+    f1 = 2.0 / (1.0 + term1 + term2 + term3);
+    
+    return f1;
+}
+
+real f2_phi(real phi)
+{
+    real f2;
+    real term1, term2, term3;
+    
+    term1 = 0.5 * (1.0 + tanh((0.95 - phi) / 0.08));
+    term2 = 1.25e-5 * (1.0 + tanh((phi - 1.3) / 0.04));
+    term3 = 0.00435 * (1.0 + tanh((phi - 1.2) / 0.04)) * (1.0 + tanh((1.2 - phi) / 0.05));
+    
+    f2 = term1 + term2 + term3;
+    
+    return f2;
+}
+
+/*----------------------------------------------------------------------
+  Calculate local equivalence ratio
+----------------------------------------------------------------------*/
+real calculate_phi(real y_ch4, real y_o2)
+{
+    real phi;
+    real stoich_o2_ch4 = 4.0; /* Stoichiometric oxygen-to-fuel mass ratio */
+    
+    if (y_o2 < 1.0e-10)
+        return 100.0; /* Very rich condition */
+    
+    phi = (y_ch4 / y_o2) * stoich_o2_ch4;
+    
+    return phi;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_VR_RATE for CH4 oxidation (first reaction)
+----------------------------------------------------------------------*/
+DEFINE_VR_RATE(ch4_oxidation_rate, cell, thread, r, mw, yi, rr, rr_t)
+{
+    real conc_ch4, conc_o2;
+    real rate;
+    real phi;
+    real temp = C_T(cell, thread);
+    real rho = C_R(cell, thread);
+    
+    /* Get species concentrations */
+    conc_ch4 = rho * yi[ID_CH4] / MW_CH4;
+    conc_o2 = rho * yi[ID_O2] / MW_O2;
+    
+    /* Calculate equivalence ratio */
+    phi = calculate_phi(yi[ID_CH4], yi[ID_O2]);
+    
+    /* Calculate reaction rate with pre-exponential correction */
+    rate = A1 * f1_phi(phi) * exp(-E1 / (R_UNIVERSAL * temp)) * 
+           pow(conc_ch4, 0.5) * pow(conc_o2, 0.65);
+    
+    /* Ensure positive reaction rate */
+    if (rate < 0.0) rate = 0.0;
+    
+    /* Store reaction rate */
+    *rr = rate;
+    
+    return rate;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_VR_RATE for CO oxidation (second reaction)
+----------------------------------------------------------------------*/
+DEFINE_VR_RATE(co_oxidation_rate, cell, thread, r, mw, yi, rr, rr_t)
+{
+    real conc_co, conc_o2;
+    real rate;
+    real phi;
+    real temp = C_T(cell, thread);
+    real rho = C_R(cell, thread);
+    
+    /* Get species concentrations */
+    conc_co = rho * yi[ID_CO] / MW_CO;
+    conc_o2 = rho * yi[ID_O2] / MW_O2;
+    
+    /* Calculate equivalence ratio */
+    phi = calculate_phi(yi[ID_CH4], yi[ID_O2]);
+    
+    /* Calculate reaction rate with pre-exponential correction */
+    rate = A2 * f2_phi(phi) * exp(-E2 / (R_UNIVERSAL * temp)) * 
+           pow(temp, 0.8) * pow(conc_co, 1.0) * pow(conc_o2, 0.5);
+    
+    /* Ensure positive reaction rate */
+    if (rate < 0.0) rate = 0.0;
+    
+    /* Store reaction rate */
+    *rr = rate;
+    
+    return rate;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_DPM_LAW for magnesium nitrate decomposition
+----------------------------------------------------------------------*/
+DEFINE_DPM_LAW(mg_nitrate_decomp, p, ci)
+{
+    real T_p = P_T(p);           /* Particle temperature */
+    real m_p = P_MASS(p);        /* Particle mass */
+    real d_p = P_DIAM(p);        /* Particle diameter */
+    real A_p = PI * d_p * d_p;   /* Particle surface area */
+    
+    /* User-defined memory for tracking particle composition */
+    /* Memory allocation in DEFINE_DPM_INJECTION_INIT (not shown) */
+    real *compound_mass = P_USER_REAL(p);
+    
+    /* Get masses of individual components */
+    real mass_hydrate = compound_mass[0];  /* Mg(NO3)2·2H2O */
+    real mass_nitrate = compound_mass[1];  /* Mg(NO3)2 */
+    real mass_oxide = compound_mass[2];    /* MgO */
+    
+    /* Calculate reaction rates */
+    real k_deh = A_DEH * exp(-E_DEH / (R_UNIVERSAL * T_p));
+    real k_den = A_DEN * exp(-E_DEN / (R_UNIVERSAL * T_p));
+    
+    /* Reaction parameters from Table 1 */
+    real beta1 = 0.95;  /* Mass transfer coefficient for H2O */
+    real beta2 = 0.95;  /* Mass transfer coefficient for NO2 */
+    real beta3 = 0.95;  /* Mass transfer coefficient for O2 */
+    real eta = 0.90;    /* Surface reaction efficiency */
+    
+    /* Mole fractions of components */
+    real y1 = mass_hydrate / m_p;  /* Hydrate fraction */
+    real y2 = mass_nitrate / m_p;  /* Nitrate fraction */
+    
+    /* Calculate mass transfer rates (kg/s) */
+    real mdot_h2o = 0.0;
+    real mdot_no2 = 0.0;
+    real mdot_o2 = 0.0;
+    
+    /* Dehydration: Mg(NO3)2·2H2O → Mg(NO3)2 + 2H2O */
+    if (mass_hydrate > 1.0e-10)
+    {
+        mdot_h2o = beta1 * y1 * eta * A_p * MW_H2O * k_deh;
+        
+        /* Limit mass loss to available hydrate */
+        if (mdot_h2o * p->time_step > mass_hydrate * (2.0 * MW_H2O / MW_MG_NITRATE_DIHYDRATE))
+            mdot_h2o = mass_hydrate * (2.0 * MW_H2O / MW_MG_NITRATE_DIHYDRATE) / p->time_step;
+    }
+    
+    /* Denitration: Mg(NO3)2 → MgO + 2NO2 + 0.5O2 */
+    if (mass_nitrate > 1.0e-10)
+    {
+        mdot_no2 = beta2 * y2 * eta * A_p * MW_NO2 * k_den;
+        mdot_o2 = beta3 * y2 * eta * A_p * MW_O2 * k_den * 0.5;
+        
+        /* Limit mass loss to available nitrate */
+        real total_gas_ratio = (2.0 * MW_NO2 + 0.5 * MW_O2) / MW_MG_NITRATE;
+        real max_gas_loss = mass_nitrate * total_gas_ratio / p->time_step;
+        
+        if ((mdot_no2 + mdot_o2) > max_gas_loss)
+        {
+            real scale_factor = max_gas_loss / (mdot_no2 + mdot_o2);
+            mdot_no2 *= scale_factor;
+            mdot_o2 *= scale_factor;
+        }
+    }
+    
+    /* Store mass transfer rates for source terms */
+    P_USER_REAL(p)[3] = mdot_h2o;  /* H2O release rate */
+    P_USER_REAL(p)[4] = mdot_no2;  /* NO2 release rate */
+    P_USER_REAL(p)[5] = mdot_o2;   /* O2 release rate */
+    
+    /* Total mass loss rate */
+    real total_mdot = mdot_h2o + mdot_no2 + mdot_o2;
+    
+    /* Update particle mass */
+    P_MASS(p) -= total_mdot * p->time_step;
+    
+    /* Update particle diameter based on density */
+    real rho_p = P_RHO(p);
+    P_DIAM(p) = pow(6.0 * P_MASS(p) / (PI * rho_p), 1.0/3.0);
+    
+    /* Update particle composition */
+    compound_mass[0] -= mdot_h2o * p->time_step * (MW_MG_NITRATE_DIHYDRATE / (2.0 * MW_H2O));
+    if (compound_mass[0] < 0.0) compound_mass[0] = 0.0;
+    
+    compound_mass[1] += mdot_h2o * p->time_step * (MW_MG_NITRATE / (2.0 * MW_H2O));
+    compound_mass[1] -= (mdot_no2 + mdot_o2) * p->time_step * (MW_MG_NITRATE / (2.0 * MW_NO2 + 0.5 * MW_O2));
+    if (compound_mass[1] < 0.0) compound_mass[1] = 0.0;
+    
+    compound_mass[2] += (mdot_no2 + mdot_o2) * p->time_step * (MW_MGO / (2.0 * MW_NO2 + 0.5 * MW_O2));
+    
+    return TRUE;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_DPM_HEAT_MASS for heat transfer during decomposition
+----------------------------------------------------------------------*/
+DEFINE_DPM_HEAT_MASS(mg_nitrate_heat_mass, p, Cp, hgas, hvap, cvap_surf, Z)
+{
+    Thread *t = P_CELL_THREAD(p);
+    cell_t c = P_CELL(p);
+    
+    real T_p = P_T(p);       /* Particle temperature */
+    real T_g = C_T(c, t);    /* Gas temperature */
+    real d_p = P_DIAM(p);    /* Particle diameter */
+    real A_p = PI * d_p * d_p; /* Particle surface area */
+    
+    /* Get mass transfer rates stored in user memory */
+    real mdot_h2o = P_USER_REAL(p)[3];
+    real mdot_no2 = P_USER_REAL(p)[4];
+    real mdot_o2 = P_USER_REAL(p)[5];
+    real total_mdot = mdot_h2o + mdot_no2 + mdot_o2;
+    
+    /* Calculate heat transfer */
+    real h = hgas;  /* Convective heat transfer coefficient */
+    real sigma = 5.67e-8;  /* Stefan-Boltzmann constant */
+    real epsilon_p = 0.85; /* Particle emissivity */
+    
+    /* Convective heat transfer */
+    real Q_conv = h * A_p * (T_g - T_p);
+    
+    /* Radiative heat transfer */
+    real Q_rad = epsilon_p * A_p * sigma * (pow(T_g, 4.0) - pow(T_p, 4.0));
+    
+    /* Reaction heat */
+    real Q_deh = -mdot_h2o * HEAT_DEH / (2.0 * MW_H2O / MW_MG_NITRATE_DIHYDRATE);
+    real Q_den = -mdot_no2 * HEAT_DEN / (2.0 * MW_NO2 / MW_MG_NITRATE);
+    
+    /* Total heat transfer */
+    real Q_total = Q_conv + Q_rad + Q_deh + Q_den;
+    
+    /* Store heat transfer components for source terms */
+    P_USER_REAL(p)[6] = Q_conv;
+    P_USER_REAL(p)[7] = Q_rad;
+    P_USER_REAL(p)[8] = Q_deh + Q_den;
+    
+    return Q_total;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for energy from combustion
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(energy_combustion_source, c, t, dS, eqn)
+{
+    Material *mix_material = THREAD_MATERIAL(t);
+    int i;
+    
+    /* Get reaction rates for CH4 and CO oxidation */
+    real rr_ch4 = C_REACTION_RATE(c, t, 0);  /* First reaction - CH4 oxidation */
+    real rr_co = C_REACTION_RATE(c, t, 1);   /* Second reaction - CO oxidation */
+    
+    /* Heats of reaction (J/kmol) */
+    real delta_H_ch4 = -5.01e8;  /* CH4 + 1.5O2 -> CO + 2H2O */
+    real delta_H_co = -2.83e8;   /* CO + 0.5O2 -> CO2 */
+    
+    /* Calculate energy source term (W/m³) */
+    real source = rr_ch4 * delta_H_ch4 + rr_co * delta_H_co;
+    
+    /* Store the heat source for tracking */
+    real cell_vol = C_VOLUME(c, t);
+    total_heat_combustion += source * cell_vol * CURRENT_TIMESTEP;
+    
+    /* Return source term */
+    dS[eqn] = 0.0;  /* Assumed linearly independent of temperature */
+    return source;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for energy from particle decomposition
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(energy_decomp_source, c, t, dS, eqn)
+{
+    real source = 0.0;
+    real cell_vol = C_VOLUME(c, t);
+    
+    /* Loop through all particles in the cell */
+    Particle *p;
+    real sum_Q_reac = 0.0;
+    
+    real n_particles = 0.0;
+    
+    loop(p, cell_thread_part(c, t))
+    {
+        /* Get reaction heat from particle user memory */
+        sum_Q_reac += P_USER_REAL(p)[8];
+        n_particles += 1.0;
+    }
+    
+    /* Calculate source term (W/m³) */
+    if (n_particles > 0.0)
+        source = -sum_Q_reac / cell_vol;
+    
+    /* Store the heat source for tracking */
+    total_heat_decomposition += source * cell_vol * CURRENT_TIMESTEP;
+    
+    /* Return source term */
+    dS[eqn] = 0.0;
+    return source;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for interface heat transfer
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(energy_interface_source, c, t, dS, eqn)
+{
+    real source = 0.0;
+    real cell_vol = C_VOLUME(c, t);
+    
+    /* Loop through all particles in the cell */
+    Particle *p;
+    real sum_Q_conv = 0.0;
+    real sum_Q_rad = 0.0;
+    
+    loop(p, cell_thread_part(c, t))
+    {
+        /* Get convective and radiative heat from particle user memory */
+        sum_Q_conv += P_USER_REAL(p)[6];
+        sum_Q_rad += P_USER_REAL(p)[7];
+    }
+    
+    /* Calculate source term (W/m³) */
+    source = -(sum_Q_conv + sum_Q_rad) / cell_vol;
+    
+    /* Return source term */
+    dS[eqn] = 0.0;
+    return source;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for H2O from dehydration
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(h2o_dehydration_source, c, t, dS, eqn)
+{
+    real source = 0.0;
+    real cell_vol = C_VOLUME(c, t);
+    
+    /* Loop through all particles in the cell */
+    Particle *p;
+    real sum_mdot_h2o = 0.0;
+    
+    loop(p, cell_thread_part(c, t))
+    {
+        /* Get H2O mass transfer rate from particle user memory */
+        sum_mdot_h2o += P_USER_REAL(p)[3];
+    }
+    
+    /* Calculate source term (kg/(m³·s)) */
+    source = sum_mdot_h2o / cell_vol;
+    
+    /* Return source term */
+    dS[eqn] = 0.0;
+    return source;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for NO2 from denitration
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(no2_denitration_source, c, t, dS, eqn)
+{
+    real source = 0.0;
+    real cell_vol = C_VOLUME(c, t);
+    
+    /* Loop through all particles in the cell */
+    Particle *p;
+    real sum_mdot_no2 = 0.0;
+    
+    loop(p, cell_thread_part(c, t))
+    {
+        /* Get NO2 mass transfer rate from particle user memory */
+        sum_mdot_no2 += P_USER_REAL(p)[4];
+    }
+    
+    /* Calculate source term (kg/(m³·s)) */
+    source = sum_mdot_no2 / cell_vol;
+    
+    /* Return source term */
+    dS[eqn] = 0.0;
+    return source;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for O2 from denitration
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(o2_denitration_source, c, t, dS, eqn)
+{
+    real source = 0.0;
+    real cell_vol = C_VOLUME(c, t);
+    
+    /* Loop through all particles in the cell */
+    Particle *p;
+    real sum_mdot_o2 = 0.0;
+    
+    loop(p, cell_thread_part(c, t))
+    {
+        /* Get O2 mass transfer rate from particle user memory */
+        sum_mdot_o2 += P_USER_REAL(p)[5];
+    }
+    
+    /* Calculate source term (kg/(m³·s)) */
+    source = sum_mdot_o2 / cell_vol;
+    
+    /* Return source term */
+    dS[eqn] = 0.0;
+    return source;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_DPM_SCALAR_UPDATE for updating particle composition
+----------------------------------------------------------------------*/
+DEFINE_DPM_SCALAR_UPDATE(update_particle_comp, c, t, initialize, p)
+{
+    if (initialize)
+    {
+        /* Initialize particle composition for a fresh particle */
+        /* Assuming initially all mass is Mg(NO3)2·2H2O */
+        P_USER_REAL(p)[0] = P_MASS(p);  /* Initial hydrate mass */
+        P_USER_REAL(p)[1] = 0.0;        /* Initial nitrate mass */
+        P_USER_REAL(p)[2] = 0.0;        /* Initial oxide mass */
+        P_USER_REAL(p)[3] = 0.0;        /* H2O release rate */
+        P_USER_REAL(p)[4] = 0.0;        /* NO2 release rate */
+        P_USER_REAL(p)[5] = 0.0;        /* O2 release rate */
+        P_USER_REAL(p)[6] = 0.0;        /* Convective heat */
+        P_USER_REAL(p)[7] = 0.0;        /* Radiative heat */
+        P_USER_REAL(p)[8] = 0.0;        /* Reaction heat */
+    }
+    else
+    {
+        /* For ongoing particles, no need to do anything here */
+        /* Everything is updated in DEFINE_DPM_LAW */
+    }
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_PROPERTY for temperature-dependent gas thermal conductivity
+----------------------------------------------------------------------*/
+DEFINE_PROPERTY(gas_thermal_conductivity, c, t)
+{
+    real temp = C_T(c, t);
+    real k;
+    
+    /* Polynomial fit for thermal conductivity (W/(m·K)) */
+    k = 0.0242 + 7.2e-5 * temp; /* Simple linear approximation */
+    
+    return k;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_PROPERTY for temperature-dependent gas viscosity
+----------------------------------------------------------------------*/
+DEFINE_PROPERTY(gas_viscosity, c, t)
+{
+    real temp = C_T(c, t);
+    real mu;
+    
+    /* Sutherland's law for air viscosity */
+    mu = 1.716e-5 * pow(temp/273.15, 1.5) * (273.15 + 110.4)/(temp + 110.4);
+    
+    return mu;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_EDC_MODEL for turbulence-chemistry interaction
+----------------------------------------------------------------------*/
+DEFINE_EDC_MODEL(edc_mg_nitrate, c, t, edc_vars)
+{
+    /* Dynamic EDC model parameters */
+    real C_xi = 2.1377;    /* Default value for the volume fraction constant */
+    real C_tau = 0.4083;   /* Default value for the time scale constant */
+    
+    /* Get turbulence parameters */
+    real k = C_K(c, t);                  /* Turbulent kinetic energy */
+    real eps = C_D(c, t);                /* Turbulent dissipation rate */
+    real nu = C_MU_L(c, t) / C_R(c, t);  /* Kinematic viscosity */
+    
+    /* Calculate EDC parameters */
+    real eta_kolm;   /* Kolmogorov length scale */
+    real tau_kolm;   /* Kolmogorov time scale */
+    real gamma_edc;  /* Volume fraction of fine structures */
+    real tau_edc;    /* Time scale for fine structure reactions */
+    
+    /* Check for valid turbulence values */
+    if (k < SMALL || eps < SMALL)
+    {
+        /* Default to no fine structure effects */
+        edc_vars->vol_frac = 0.0;
+        edc_vars->time_scale = GREAT;
+        return;
+    }
+    
+    /* Calculate Kolmogorov scales */
+    eta_kolm = pow(pow(nu, 3.0) / eps, 0.25);
+    tau_kolm = sqrt(nu / eps);
+    
+    /* Calculate EDC model parameters */
+    gamma_edc = C_xi * pow(nu * eps / (k * k), 0.25);
+    tau_edc = C_tau * sqrt(nu / eps);
+    
+    /* For high temperature regions, adjust model constants */
+    real temp = C_T(c, t);
+    if (temp > 1500.0)
+    {
+        /* Adjust constants for high-temperature reactions */
+        real scale = (temp - 1500.0) / 500.0;
+        if (scale > 1.0) scale = 1.0;
+        
+        C_xi = C_xi * (1.0 + 0.2 * scale);
+        C_tau = C_tau * (1.0 - 0.1 * scale);
+        
+        /* Recalculate EDC parameters */
+        gamma_edc = C_xi * pow(nu * eps / (k * k), 0.25);
+        tau_edc = C_tau * sqrt(nu / eps);
+    }
+    
+    /* Store the results */
+    edc_vars->vol_frac = pow(gamma_edc, 2.0);
+    edc_vars->time_scale = tau_edc;
+}
+
+/*----------------------------------------------------------------------
+  DEFINE_SOURCE for heat recovery at outlet (Equation 19)
+----------------------------------------------------------------------*/
+DEFINE_SOURCE(heat_recovery_source, c, t, dS, eqn)
+{
+    real source = 0.0;
+    
+    /* Only apply at outlet boundary zones (thread ID needs to be set correctly) */
+    Thread *outlet_thread = Lookup_Thread(domain, ID_OUTLET_ZONE);
+    
+    if (t == outlet_thread)
+    {
+        real eta_rec = 0.65;      /* Heat recovery efficiency */
+        real T = C_T(c, t);       /* Current temperature */
+        real T_ref = 298.15;      /* Reference temperature (ambient, K) */
+        real Cp = C_CP(c, t);     /* Specific heat capacity */
+        real mdot = C_R(c, t) * MAG(C_U(c, t)) * C_AREA(c, t);  /* Mass flow rate */
+        
+        /* Calculate heat recovery source term */
+        source = -eta_rec * Cp * mdot * (T - T_ref) / C_VOLUME(c, t);
+        
+        /* Derivative for better convergence */
+        dS[eqn] = -eta_rec * Cp * mdot / C_VOLUME(c, t);
+    }
+    
+    return source;
+}
