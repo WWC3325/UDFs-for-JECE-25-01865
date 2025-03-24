@@ -10,10 +10,10 @@
 #define E2 12000.0    /* Activation energy for CO oxidation [J/mol] */
 
 /* Constants for Mg(NO3)2·2H2O decomposition */
-#define A_DEH 1.0e13  /* Pre-exponential factor for dehydration */ 
-#define E_DEH 88000.0 /* Activation energy for dehydration [J/mol] */
-#define A_DEN 2.5e14  /* Pre-exponential factor for denitration */
-#define E_DEN 180000.0 /* Activation energy for denitration [J/mol] */
+#define A_DEH 1.5e11  /* Pre-exponential factor for dehydration */ 
+#define E_DEH 137000.0 /* Activation energy for dehydration [J/mol] */
+#define A_DEN 8.8e15  /* Pre-exponential factor for denitration */
+#define E_DEN 227000.0 /* Activation energy for denitration [J/mol] */
 
 /* Molecular weights [kg/mol] */
 #define MW_H2O 0.018015
@@ -30,8 +30,8 @@
 #define R_UNIVERSAL 8.3145
 
 /* Heat of reactions [J/kg] */
-#define HEAT_DEH 880000.0   /* Heat for dehydration */
-#define HEAT_DEN 2100000.0  /* Heat for denitration */
+#define HEAT_DEH 111200.0   /* Heat for dehydration */
+#define HEAT_DEN 852200.0  /* Heat for denitration */
 
 /* Species indices - must match Fluent species order */
 /* These need to be adjusted based on your specific setup */
